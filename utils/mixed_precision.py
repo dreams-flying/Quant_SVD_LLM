@@ -145,6 +145,73 @@ def collect_kfac_stats_diagonal(
     return stats
 
 
+def collect_kfac_stats_block_b(
+    model: nn.Module,
+    pairs: List[PairModules],
+    dataloader,
+    device: str = "cuda",
+    nsamples: int = 8,
+    block_size: int = 128,
+) -> Dict[str, Dict[str, object]]:
+    stats: Dict[str, Dict[str, object]] = {}
+    handles = []
+    use_cache = getattr(model.config, "use_cache", False)
+    model.config.use_cache = False
+    model.eval()
+
+    for pair in pairs:
+        out_dim = pair.u_module.out_features
+        nblocks = (out_dim + block_size - 1) // block_size
+        stats[pair.key] = {
+            "block_size": block_size,
+            "out_dim": out_dim,
+            "B_blocks": [],
+            "count_b": 0.0,
+        }
+        for bi in range(nblocks):
+            s = bi * block_size
+            e = min((bi + 1) * block_size, out_dim)
+            stats[pair.key]["B_blocks"].append(torch.zeros((e - s, e - s), dtype=torch.float64))
+
+        def mk_bwd(k):
+            def _hook(module, grad_input, grad_output):
+                g = grad_output[0].detach().float()
+                g_flat = g.reshape(-1, g.shape[-1])
+                stats[k]["count_b"] += float(g_flat.shape[0])
+                bsz = int(stats[k]["block_size"])
+                for bi, blk in enumerate(stats[k]["B_blocks"]):
+                    s = bi * bsz
+                    e = min((bi + 1) * bsz, g_flat.shape[-1])
+                    gb = g_flat[:, s:e]
+                    cov = gb.transpose(0, 1).matmul(gb).to(dtype=torch.float64).cpu()
+                    stats[k]["B_blocks"][bi].add_(cov)
+
+            return _hook
+
+        handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
+
+    for idx, batch in enumerate(dataloader):
+        if idx >= nsamples:
+            break
+        input_ids, labels = batch[0].to(device), batch[1].to(device)
+        model.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, labels=labels, use_cache=False)
+        out.loss.backward()
+
+    for h in handles:
+        h.remove()
+
+    for key, v in stats.items():
+        cb = max(float(v["count_b"]), 1.0)
+        for bi in range(len(v["B_blocks"])):
+            v["B_blocks"][bi] = (v["B_blocks"][bi] / cb).float()
+        del v["count_b"]
+
+    model.zero_grad(set_to_none=True)
+    model.config.use_cache = use_cache
+    return stats
+
+
 def compute_component_importance(
     pairs: List[PairModules], stats: Dict[str, Dict[str, torch.Tensor]]
 ) -> Dict[str, torch.Tensor]:
@@ -159,6 +226,42 @@ def compute_component_importance(
         u_term = (U.pow(2) * B_diag[:, None]).sum(dim=0)
         v_term = (V.pow(2) * A_diag[None, :]).sum(dim=1)
         score = (u_term * v_term).clamp_min(1e-12)
+        out[pair.key] = score.detach().cpu()
+    return out
+
+
+def compute_component_importance_block_b(
+    pairs: List[PairModules],
+    stats: Dict[str, Dict[str, object]],
+    assume_a_identity: bool = True,
+    a_diag_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for pair in pairs:
+        if pair.key not in stats:
+            continue
+        U = pair.u_module.weight.data.float()
+        V = pair.v_module.weight.data.float()
+        dev = U.device
+        rank = U.shape[1]
+        b_term = torch.zeros(rank, device=dev, dtype=torch.float32)
+        blk_size = int(stats[pair.key]["block_size"])
+        B_blocks: List[torch.Tensor] = stats[pair.key]["B_blocks"]  # type: ignore[assignment]
+        for bi, B_blk_cpu in enumerate(B_blocks):
+            s = bi * blk_size
+            e = min((bi + 1) * blk_size, U.shape[0])
+            U_blk = U[s:e, :]
+            B_blk = B_blk_cpu.to(device=dev, dtype=torch.float32)
+            b_term += (U_blk * (B_blk.matmul(U_blk))).sum(dim=0)
+
+        if assume_a_identity:
+            a_term = V.pow(2).sum(dim=1)
+        else:
+            if a_diag_stats is None or pair.key not in a_diag_stats:
+                raise ValueError("a_diag_stats is required when assume_a_identity=False")
+            A_diag = a_diag_stats[pair.key]["A_diag"].to(dev, dtype=torch.float32)
+            a_term = (V.pow(2) * A_diag[None, :]).sum(dim=1)
+        score = (b_term * a_term).clamp_min(1e-12)
         out[pair.key] = score.detach().cpu()
     return out
 

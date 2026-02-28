@@ -9,7 +9,9 @@ from gptq.quant import *
 from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
+    collect_kfac_stats_block_b,
     collect_kfac_stats_diagonal,
+    compute_component_importance_block_b,
     compute_component_importance,
     discover_low_rank_pairs,
     solve_budgeted_topk,
@@ -305,6 +307,14 @@ if __name__ == '__main__':
         help='Number of calibration mini-batches used to estimate diagonal KFAC factors.'
     )
     parser.add_argument(
+        '--mp-kfac-mode', type=str, default='block_b', choices=['block_b', 'diag'],
+        help='KFAC approximation used for component importance.'
+    )
+    parser.add_argument(
+        '--mp-kfac-block-size', type=int, default=128,
+        help='Block size for Block-KFAC(B) covariance.'
+    )
+    parser.add_argument(
         '--mp-low-bit', type=int, default=4, choices=[2, 3, 4, 8],
         help='Low precision bit-width for residual components.'
     )
@@ -346,15 +356,30 @@ if __name__ == '__main__':
         pairs = discover_low_rank_pairs(model)
         if len(pairs) == 0:
             raise RuntimeError("No low-rank *_u_proj/*_v_proj pairs found. Please use an SVD-compressed model.")
-        print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision.")
-        stats = collect_kfac_stats_diagonal(
-            model=model,
-            pairs=pairs,
-            dataloader=dataloader,
-            device=args.DEV,
-            nsamples=args.mp_kfac_nsamples,
-        )
-        importance = compute_component_importance(pairs, stats)
+        print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision. mode={args.mp_kfac_mode}")
+        if args.mp_kfac_mode == "block_b":
+            stats = collect_kfac_stats_block_b(
+                model=model,
+                pairs=pairs,
+                dataloader=dataloader,
+                device=args.DEV,
+                nsamples=args.mp_kfac_nsamples,
+                block_size=args.mp_kfac_block_size,
+            )
+            importance = compute_component_importance_block_b(
+                pairs=pairs,
+                stats=stats,
+                assume_a_identity=True,
+            )
+        else:
+            stats = collect_kfac_stats_diagonal(
+                model=model,
+                pairs=pairs,
+                dataloader=dataloader,
+                device=args.DEV,
+                nsamples=args.mp_kfac_nsamples,
+            )
+            importance = compute_component_importance(pairs, stats)
         alloc = solve_budgeted_topk(
             pairs=pairs,
             importance=importance,
