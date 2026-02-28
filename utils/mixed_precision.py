@@ -152,6 +152,9 @@ def collect_kfac_stats_block_b(
     device: str = "cuda",
     nsamples: int = 8,
     block_size: int = 128,
+    collect_a_diag: bool = True,
+    shrink_lambda: float = 0.1,
+    diag_damp: float = 1e-6,
 ) -> Dict[str, Dict[str, object]]:
     stats: Dict[str, Dict[str, object]] = {}
     handles = []
@@ -167,11 +170,24 @@ def collect_kfac_stats_block_b(
             "out_dim": out_dim,
             "B_blocks": [],
             "count_b": 0.0,
+            "A_diag": torch.zeros(pair.v_module.in_features, dtype=torch.float64),
+            "count_a": 0.0,
         }
         for bi in range(nblocks):
             s = bi * block_size
             e = min((bi + 1) * block_size, out_dim)
             stats[pair.key]["B_blocks"].append(torch.zeros((e - s, e - s), dtype=torch.float64))
+
+        def mk_fwd_pre(k):
+            def _hook(module, inputs):
+                if not collect_a_diag:
+                    return
+                x = inputs[0].detach().float()
+                x_flat = x.reshape(-1, x.shape[-1])
+                stats[k]["A_diag"] += x_flat.pow(2).sum(dim=0).to(dtype=torch.float64).cpu()
+                stats[k]["count_a"] += float(x_flat.shape[0])
+
+            return _hook
 
         def mk_bwd(k):
             def _hook(module, grad_input, grad_output):
@@ -188,6 +204,7 @@ def collect_kfac_stats_block_b(
 
             return _hook
 
+        handles.append(pair.v_module.register_forward_pre_hook(mk_fwd_pre(pair.key)))
         handles.append(pair.u_module.register_full_backward_hook(mk_bwd(pair.key)))
 
     for idx, batch in enumerate(dataloader):
@@ -204,8 +221,20 @@ def collect_kfac_stats_block_b(
     for key, v in stats.items():
         cb = max(float(v["count_b"]), 1.0)
         for bi in range(len(v["B_blocks"])):
-            v["B_blocks"][bi] = (v["B_blocks"][bi] / cb).float()
+            blk = (v["B_blocks"][bi] / cb).float()
+            if shrink_lambda > 0:
+                blk_diag = torch.diag(torch.diag(blk))
+                blk = (1.0 - shrink_lambda) * blk + shrink_lambda * blk_diag
+            if diag_damp > 0:
+                blk = blk + diag_damp * torch.eye(blk.shape[0], dtype=blk.dtype)
+            v["B_blocks"][bi] = blk
+        ca = max(float(v["count_a"]), 1.0)
+        if collect_a_diag:
+            v["A_diag"] = (v["A_diag"] / ca).float()
+        else:
+            v["A_diag"] = None
         del v["count_b"]
+        del v["count_a"]
 
     model.zero_grad(set_to_none=True)
     model.config.use_cache = use_cache
@@ -233,8 +262,9 @@ def compute_component_importance(
 def compute_component_importance_block_b(
     pairs: List[PairModules],
     stats: Dict[str, Dict[str, object]],
-    assume_a_identity: bool = True,
-    a_diag_stats: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+    a_mode: str = "adaptive",
+    adaptive_alpha: Optional[float] = None,
+    adaptive_tau: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for pair in pairs:
@@ -254,13 +284,27 @@ def compute_component_importance_block_b(
             B_blk = B_blk_cpu.to(device=dev, dtype=torch.float32)
             b_term += (U_blk * (B_blk.matmul(U_blk))).sum(dim=0)
 
-        if assume_a_identity:
+        if a_mode == "identity":
             a_term = V.pow(2).sum(dim=1)
         else:
-            if a_diag_stats is None or pair.key not in a_diag_stats:
-                raise ValueError("a_diag_stats is required when assume_a_identity=False")
-            A_diag = a_diag_stats[pair.key]["A_diag"].to(dev, dtype=torch.float32)
-            a_term = (V.pow(2) * A_diag[None, :]).sum(dim=1)
+            A_diag_cpu = stats[pair.key].get("A_diag", None)
+            if A_diag_cpu is None:
+                raise ValueError("A_diag was not collected but a_mode is not identity")
+            A_diag = A_diag_cpu.to(dev, dtype=torch.float32)
+            if a_mode == "diag":
+                a_weight = A_diag
+            elif a_mode == "adaptive":
+                mean_a = A_diag.mean().clamp_min(1e-12)
+                norm_a = A_diag / mean_a
+                if adaptive_alpha is None:
+                    cv2 = torch.mean((norm_a - 1.0).pow(2))
+                    alpha = (cv2 / (cv2 + adaptive_tau)).clamp(0.0, 1.0)
+                else:
+                    alpha = torch.tensor(float(adaptive_alpha), device=dev, dtype=torch.float32).clamp(0.0, 1.0)
+                a_weight = (1.0 - alpha) + alpha * norm_a
+            else:
+                raise ValueError(f"Unsupported a_mode: {a_mode}")
+            a_term = (V.pow(2) * a_weight[None, :]).sum(dim=1)
         score = (b_term * a_term).clamp_min(1e-12)
         out[pair.key] = score.detach().cpu()
     return out
@@ -279,6 +323,7 @@ def solve_budgeted_topk(
     low_bit: int = 4,
     high_bit: int = 8,
     avg_bit: float = 4.5,
+    sigma_calib: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
 ) -> Dict[str, torch.Tensor]:
     if high_bit <= low_bit:
         raise ValueError("high_bit must be larger than low_bit")
@@ -294,7 +339,13 @@ def solve_budgeted_topk(
         params_per_component = float(out_dim + in_dim)
         total_params += params_per_component * float(rank)
         for i in range(rank):
-            value = float(score[i].item()) * (_quant_noise_proxy(low_bit) - _quant_noise_proxy(high_bit))
+            if sigma_calib is not None and pair.key in sigma_calib:
+                sigma_low = float(sigma_calib[pair.key]["low"][i].item())
+                sigma_high = float(sigma_calib[pair.key]["high"][i].item())
+                gain = max(sigma_low - sigma_high, 0.0)
+            else:
+                gain = _quant_noise_proxy(low_bit) - _quant_noise_proxy(high_bit)
+            value = float(score[i].item()) * gain
             delta_cost = params_per_component * float(high_bit - low_bit)
             density = value / max(delta_cost, 1e-12)
             items.append((density, value, delta_cost, pair.key, i))
@@ -321,6 +372,49 @@ def solve_budgeted_topk(
                 mask[i] = True
         alloc[pair.key] = mask
     return alloc
+
+
+def _quantize_vec_symmetric(vec: torch.Tensor, bits: int) -> torch.Tensor:
+    qmax = float((2 ** (bits - 1)) - 1)
+    if qmax <= 0:
+        return torch.zeros_like(vec)
+    scale = vec.abs().max().clamp_min(1e-8) / qmax
+    q = torch.round(vec / scale).clamp(-qmax, qmax)
+    return q * scale
+
+
+def _rank1_outer_error(u: torch.Tensor, v: torch.Tensor, uq: torch.Tensor, vq: torch.Tensor) -> torch.Tensor:
+    uu = torch.dot(u, u)
+    vv = torch.dot(v, v)
+    uquq = torch.dot(uq, uq)
+    vqvq = torch.dot(vq, vq)
+    cross = torch.dot(u, uq) * torch.dot(v, vq)
+    return (uu * vv + uquq * vqvq - 2.0 * cross).clamp_min(0.0)
+
+
+def calibrate_component_sigma(
+    pairs: List[PairModules],
+    low_bit: int = 4,
+    high_bit: int = 8,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    sigma: Dict[str, Dict[str, torch.Tensor]] = {}
+    for pair in pairs:
+        U = pair.u_module.weight.data.float().cpu()
+        V = pair.v_module.weight.data.float().cpu()
+        rank = U.shape[1]
+        low = torch.zeros(rank, dtype=torch.float32)
+        high = torch.zeros(rank, dtype=torch.float32)
+        for i in range(rank):
+            u = U[:, i]
+            v = V[i, :]
+            uq_l = _quantize_vec_symmetric(u, low_bit)
+            vq_l = _quantize_vec_symmetric(v, low_bit)
+            uq_h = _quantize_vec_symmetric(u, high_bit)
+            vq_h = _quantize_vec_symmetric(v, high_bit)
+            low[i] = _rank1_outer_error(u, v, uq_l, vq_l)
+            high[i] = _rank1_outer_error(u, v, uq_h, vq_h)
+        sigma[pair.key] = {"low": low, "high": high}
+    return sigma
 
 
 class TwoPathLowRankLinear(nn.Module):

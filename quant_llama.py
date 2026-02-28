@@ -9,6 +9,7 @@ from gptq.quant import *
 from evaluater import ppl_eval
 from utils.mixed_precision import (
     apply_two_path_quantization,
+    calibrate_component_sigma,
     collect_kfac_stats_block_b,
     collect_kfac_stats_diagonal,
     compute_component_importance_block_b,
@@ -315,6 +316,30 @@ if __name__ == '__main__':
         help='Block size for Block-KFAC(B) covariance.'
     )
     parser.add_argument(
+        '--mp-b-shrinkage', type=float, default=0.1,
+        help='Shrinkage strength for Block-KFAC(B): B=(1-lambda)B+lambda*diag(B).'
+    )
+    parser.add_argument(
+        '--mp-b-damp', type=float, default=1e-6,
+        help='Diagonal damping added to each B block.'
+    )
+    parser.add_argument(
+        '--mp-a-mode', type=str, default='adaptive', choices=['identity', 'diag', 'adaptive'],
+        help='A-side approximation mode.'
+    )
+    parser.add_argument(
+        '--mp-a-alpha', type=float, default=-1.0,
+        help='Fixed alpha for adaptive A weighting. Negative means auto-estimate.'
+    )
+    parser.add_argument(
+        '--mp-a-adaptive-tau', type=float, default=0.5,
+        help='Tau used by auto alpha estimator in adaptive A mode.'
+    )
+    parser.add_argument(
+        '--mp-sigma-mode', type=str, default='calibrated', choices=['proxy', 'calibrated'],
+        help='Noise model used in budgeted allocation.'
+    )
+    parser.add_argument(
         '--mp-low-bit', type=int, default=4, choices=[2, 3, 4, 8],
         help='Low precision bit-width for residual components.'
     )
@@ -365,11 +390,16 @@ if __name__ == '__main__':
                 device=args.DEV,
                 nsamples=args.mp_kfac_nsamples,
                 block_size=args.mp_kfac_block_size,
+                collect_a_diag=(args.mp_a_mode != "identity"),
+                shrink_lambda=args.mp_b_shrinkage,
+                diag_damp=args.mp_b_damp,
             )
             importance = compute_component_importance_block_b(
                 pairs=pairs,
                 stats=stats,
-                assume_a_identity=True,
+                a_mode=args.mp_a_mode,
+                adaptive_alpha=None if args.mp_a_alpha < 0 else args.mp_a_alpha,
+                adaptive_tau=args.mp_a_adaptive_tau,
             )
         else:
             stats = collect_kfac_stats_diagonal(
@@ -380,12 +410,20 @@ if __name__ == '__main__':
                 nsamples=args.mp_kfac_nsamples,
             )
             importance = compute_component_importance(pairs, stats)
+        sigma_calib = None
+        if args.mp_sigma_mode == "calibrated":
+            sigma_calib = calibrate_component_sigma(
+                pairs=pairs,
+                low_bit=args.mp_low_bit,
+                high_bit=args.mp_high_bit,
+            )
         alloc = solve_budgeted_topk(
             pairs=pairs,
             importance=importance,
             low_bit=args.mp_low_bit,
             high_bit=args.mp_high_bit,
             avg_bit=args.mp_avg_bit,
+            sigma_calib=sigma_calib,
         )
         report_mixed_precision_allocation(pairs, alloc)
         apply_two_path_quantization(
