@@ -338,6 +338,10 @@ class TwoPathLowRankLinear(nn.Module):
         self.high_bit = high_bit
         self.low_bit = low_bit
         self.out_features = u_weight.shape[0]
+        self._runtime_u: Optional[torch.Tensor] = None
+        self._runtime_v: Optional[torch.Tensor] = None
+        self._runtime_device: Optional[torch.device] = None
+        self._runtime_dtype: Optional[torch.dtype] = None
         self.register_buffer("high_idx", high_idx.to(torch.long), persistent=False)
         self.register_buffer("low_idx", low_idx.to(torch.long), persistent=False)
 
@@ -386,24 +390,44 @@ class TwoPathLowRankLinear(nn.Module):
         sf = s.to(device=device, dtype=torch.float32).unsqueeze(1)
         return (qf * sf).to(dtype=dtype)
 
+    def _build_runtime_cache(self, device: torch.device, dtype: torch.dtype):
+        if (
+            self._runtime_u is not None
+            and self._runtime_v is not None
+            and self._runtime_device == device
+            and self._runtime_dtype == dtype
+        ):
+            return
+        parts_u = []
+        parts_v = []
+        if self.uh_q.numel() > 0:
+            parts_u.append(self._deq_per_row(self.uh_q, self.uh_s, device, dtype))
+            parts_v.append(self._deq_per_row(self.vh_q, self.vh_s, device, dtype))
+        if self.ul_q.numel() > 0:
+            parts_u.append(self._deq_per_row(self.ul_q, self.ul_s, device, dtype))
+            parts_v.append(self._deq_per_row(self.vl_q, self.vl_s, device, dtype))
+        if len(parts_u) == 0:
+            self._runtime_u = torch.zeros((self.out_features, 0), device=device, dtype=dtype)
+            self._runtime_v = torch.zeros((0, 0), device=device, dtype=dtype)
+        elif len(parts_u) == 1:
+            self._runtime_u = parts_u[0]
+            self._runtime_v = parts_v[0]
+        else:
+            # Runtime fuse two paths into one low-rank chain: y = [Uh Ul]([Vh;Vl]x)
+            self._runtime_u = torch.cat(parts_u, dim=1)
+            self._runtime_v = torch.cat(parts_v, dim=0)
+        self._runtime_device = device
+        self._runtime_dtype = dtype
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = None
         dtype = x.dtype
         dev = x.device
-        if self.uh_q.numel() > 0:
-            vh = self._deq_per_row(self.vh_q, self.vh_s, dev, dtype)
-            uh = self._deq_per_row(self.uh_q, self.uh_s, dev, dtype)
-            zh = F.linear(x, vh)
-            out_h = F.linear(zh, uh)
-            out = out_h if out is None else out + out_h
-        if self.ul_q.numel() > 0:
-            vl = self._deq_per_row(self.vl_q, self.vl_s, dev, dtype)
-            ul = self._deq_per_row(self.ul_q, self.ul_s, dev, dtype)
-            zl = F.linear(x, vl)
-            out_l = F.linear(zl, ul)
-            out = out_l if out is None else out + out_l
-        if out is None:
+        self._build_runtime_cache(dev, dtype)
+        if self._runtime_u is None or self._runtime_v is None or self._runtime_v.numel() == 0:
             out = torch.zeros((*x.shape[:-1], self.out_features), device=dev, dtype=dtype)
+        else:
+            z = F.linear(x, self._runtime_v)
+            out = F.linear(z, self._runtime_u)
         if self.bias is not None:
             out = out + self.bias.to(device=dev, dtype=dtype)
         return out
