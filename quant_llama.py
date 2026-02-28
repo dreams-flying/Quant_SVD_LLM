@@ -7,6 +7,13 @@ from gptq.gptq import *
 from utils.model_utils import *
 from gptq.quant import *
 from evaluater import ppl_eval
+from utils.mixed_precision import (
+    apply_two_path_quantization,
+    collect_kfac_stats_diagonal,
+    compute_component_importance,
+    discover_low_rank_pairs,
+    solve_budgeted_topk,
+)
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -229,6 +236,20 @@ def llama_pack3(model, quantizers):
     return model
 
 
+@torch.no_grad()
+def report_mixed_precision_allocation(pairs, alloc):
+    total = 0
+    high = 0
+    for p in pairs:
+        if p.key not in alloc:
+            continue
+        mask = alloc[p.key]
+        total += int(mask.numel())
+        high += int(mask.sum().item())
+    low = total - high
+    print(f"Mixed-precision allocation: high={high}, low={low}, total={total}")
+
+
 if __name__ == '__main__':
     import argparse
     from utils.data_utils import *
@@ -276,6 +297,26 @@ if __name__ == '__main__':
         help='Save quantized checkpoint under this name.'
     )
     parser.add_argument(
+        '--mp-enable', action='store_true',
+        help='Enable KFAC-weighted budgeted 8/4-bit two-path quantization on SVD low-rank pairs.'
+    )
+    parser.add_argument(
+        '--mp-kfac-nsamples', type=int, default=8,
+        help='Number of calibration mini-batches used to estimate diagonal KFAC factors.'
+    )
+    parser.add_argument(
+        '--mp-low-bit', type=int, default=4, choices=[2, 3, 4, 8],
+        help='Low precision bit-width for residual components.'
+    )
+    parser.add_argument(
+        '--mp-high-bit', type=int, default=8, choices=[4, 8, 16],
+        help='High precision bit-width for dominant components.'
+    )
+    parser.add_argument(
+        '--mp-avg-bit', type=float, default=4.5,
+        help='Target average bit-width under budgeted top-k selection.'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -300,7 +341,36 @@ if __name__ == '__main__':
     
     dataloader, testloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, tokenizer=tokenizer)
 
-    if args.wbits < 16 and not args.nearest:
+    if args.mp_enable:
+        model = model.to(args.DEV)
+        pairs = discover_low_rank_pairs(model)
+        if len(pairs) == 0:
+            raise RuntimeError("No low-rank *_u_proj/*_v_proj pairs found. Please use an SVD-compressed model.")
+        print(f"Found {len(pairs)} low-rank pairs for KFAC-weighted mixed precision.")
+        stats = collect_kfac_stats_diagonal(
+            model=model,
+            pairs=pairs,
+            dataloader=dataloader,
+            device=args.DEV,
+            nsamples=args.mp_kfac_nsamples,
+        )
+        importance = compute_component_importance(pairs, stats)
+        alloc = solve_budgeted_topk(
+            pairs=pairs,
+            importance=importance,
+            low_bit=args.mp_low_bit,
+            high_bit=args.mp_high_bit,
+            avg_bit=args.mp_avg_bit,
+        )
+        report_mixed_precision_allocation(pairs, alloc)
+        apply_two_path_quantization(
+            model=model,
+            pairs=pairs,
+            alloc=alloc,
+            high_bit=args.mp_high_bit,
+            low_bit=args.mp_low_bit,
+        )
+    elif args.wbits < 16 and not args.nearest:
         tick = time.time()
         quantizers = llama_sequential(model, dataloader, args.DEV)
         print(time.time() - tick)
@@ -308,8 +378,11 @@ if __name__ == '__main__':
     #     llama_pack3(model, quantizers)
     #     torch.save(model.state_dict(), args.save)
     ppl_eval(model, tokenizer, datasets=['wikitext2'], model_seq_len=2048, batch_size=16, device=args.DEV)
-    torch.save({
+    if args.save:
+        torch.save(
+            {
                 'model': model,
                 'tokenizer': tokenizer
-            }, args.save) 
-
+            },
+            args.save,
+        )

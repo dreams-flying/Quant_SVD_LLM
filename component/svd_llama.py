@@ -102,12 +102,24 @@ class SVD_LlamaMLP(nn.Module):
         
         self.up_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
         self.up_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
+        self.gate_mp_proj = None
+        self.down_mp_proj = None
+        self.up_mp_proj = None
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
-        up = self.up_u_proj(self.up_v_proj(x))
-        gate = self.gate_u_proj(self.gate_v_proj(x))
-        return self.down_u_proj(self.down_v_proj(self.act_fn(gate) * up))
+        if self.up_mp_proj is None:
+            up = self.up_u_proj(self.up_v_proj(x))
+        else:
+            up = self.up_mp_proj(x)
+        if self.gate_mp_proj is None:
+            gate = self.gate_u_proj(self.gate_v_proj(x))
+        else:
+            gate = self.gate_mp_proj(x)
+        hidden = self.act_fn(gate) * up
+        if self.down_mp_proj is None:
+            return self.down_u_proj(self.down_v_proj(hidden))
+        return self.down_mp_proj(hidden)
 
 
 class SVD_LlamaAttention(nn.Module):
@@ -139,6 +151,10 @@ class SVD_LlamaAttention(nn.Module):
 
         self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
         self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+        self.q_mp_proj = None
+        self.k_mp_proj = None
+        self.v_mp_proj = None
+        self.o_mp_proj = None
 
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
@@ -156,11 +172,23 @@ class SVD_LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
     
-        query_states = self.q_u_proj(self.q_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.q_mp_proj is None:
+            query_states = self.q_u_proj(self.q_v_proj(hidden_states))
+        else:
+            query_states = self.q_mp_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        key_states = self.k_u_proj(self.k_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.k_mp_proj is None:
+            key_states = self.k_u_proj(self.k_v_proj(hidden_states))
+        else:
+            key_states = self.k_mp_proj(hidden_states)
+        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        value_states = self.v_u_proj(self.v_v_proj(hidden_states)).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.v_mp_proj is None:
+            value_states = self.v_u_proj(self.v_v_proj(hidden_states))
+        else:
+            value_states = self.v_mp_proj(hidden_states)
+        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -206,7 +234,10 @@ class SVD_LlamaAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
-        attn_output = self.o_u_proj(self.o_v_proj(attn_output))
+        if self.o_mp_proj is None:
+            attn_output = self.o_u_proj(self.o_v_proj(attn_output))
+        else:
+            attn_output = self.o_mp_proj(attn_output)
 
         if not output_attentions:
             attn_weights = None
